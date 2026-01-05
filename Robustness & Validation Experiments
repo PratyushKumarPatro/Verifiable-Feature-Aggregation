@@ -1,0 +1,228 @@
+# ===============================================================
+# MUST-DO Robustness & Validation Experiments (PRINT-ONLY)
+# Verifiable Feature Aggregation (VFA) – ICBC 2026
+# ===============================================================
+
+import time
+import hashlib
+import random
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+FILE_PATH = 'transaction.csv'
+ADDRESS_COLUMN = 'Address'
+LABEL_COLUMN = 'FLAG'
+
+FEATURE_COLUMNS = [
+    'Sent tnx',
+    'Received Tnx',
+    'total transactions (including tnx to create contract',
+    'total Ether sent',
+    'total ether received',
+    'total ether balance',
+    'avg val sent',
+    'min value received',
+    'max value received ',
+    'avg val received'
+]
+
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+
+# ---------------------------
+# HASHING + MERKLE HELPERS
+# ---------------------------
+def sha256(x):
+    return hashlib.sha256(x.encode()).hexdigest()
+
+def merkle_root(hashes):
+    hashes = sorted(hashes)
+    if not hashes:
+        return None
+    while len(hashes) > 1:
+        if len(hashes) % 2 == 1:
+            hashes.append(hashes[-1])
+        hashes = [sha256(hashes[i] + hashes[i+1]) for i in range(0, len(hashes), 2)]
+    return hashes[0]
+
+def hash_features(feat_dict):
+    canonical = '|'.join(f"{k}:{round(float(v),6)}" for k,v in sorted(feat_dict.items()))
+    return sha256(canonical)
+
+# ---------------------------
+# LOAD + PREP DATA
+# ---------------------------
+print("\n=== Loading dataset ===")
+df = pd.read_csv(FILE_PATH)
+
+for col in FEATURE_COLUMNS:
+    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+df[LABEL_COLUMN] = pd.to_numeric(df[LABEL_COLUMN], errors='coerce').fillna(0).astype(int)
+
+print(f"Total rows: {len(df)}")
+print("Fraud distribution (%):")
+print(df[LABEL_COLUMN].value_counts(normalize=True) * 100)
+
+# ---------------------------
+# MAP PHASE (hash transactions)
+# ---------------------------
+print("\n=== Map phase: hashing transactions ===")
+df['tx_hash'] = df.apply(
+    lambda r: sha256(r[ADDRESS_COLUMN] + "|" + "|".join(str(r[c]) for c in FEATURE_COLUMNS)),
+    axis=1
+)
+
+# ---------------------------
+# REDUCE PHASE (aggregate + commitments)
+# ---------------------------
+print("\n=== Reduce phase: aggregation + commitments ===")
+agg_rows = []
+
+for addr, g in tqdm(df.groupby(ADDRESS_COLUMN)):
+    feats = g[FEATURE_COLUMNS].mean().to_dict()
+    label = int(g[LABEL_COLUMN].mean() >= 0.5)
+    root = merkle_root(g['tx_hash'].tolist())
+    commit = hash_features(feats)
+
+    agg_rows.append({
+        ADDRESS_COLUMN: addr,
+        **feats,
+        LABEL_COLUMN: label,
+        'merkle_root': root,
+        'feature_commitment': commit,
+        'tx_count': len(g)
+    })
+
+agg_df = pd.DataFrame(agg_rows)
+print(f"Aggregated wallets: {len(agg_df)}")
+
+# ---------------------------
+# VERIFIER
+# ---------------------------
+def verify_vfa(addr, original_df, agg_row):
+    wallet = original_df[original_df[ADDRESS_COLUMN] == addr]
+    root = merkle_root(wallet['tx_hash'].tolist())
+    feats = wallet[FEATURE_COLUMNS].mean().to_dict()
+    commit = hash_features(feats)
+    return root == agg_row['merkle_root'] and commit == agg_row['feature_commitment']
+
+# ===============================================================
+# A. TAMPER DETECTION
+# ===============================================================
+print("\n=== A. Tamper Detection Test ===")
+samples = agg_df.sample(200, random_state=SEED)
+detected = 0
+
+for _, row in samples.iterrows():
+    df_t = df.copy()
+    wallet_rows = df_t[df_t[ADDRESS_COLUMN] == row[ADDRESS_COLUMN]].sample(1)
+    idx = wallet_rows.index[0]
+    col = random.choice(FEATURE_COLUMNS)
+
+    df_t.at[idx, col] *= 1.01  # 1% tamper
+    df_t.at[idx, 'tx_hash'] = sha256(
+        df_t.at[idx, ADDRESS_COLUMN] + "|" +
+        "|".join(str(df_t.at[idx, c]) for c in FEATURE_COLUMNS)
+    )
+
+    if not verify_vfa(row[ADDRESS_COLUMN], df_t, row):
+        detected += 1
+
+rate = detected / len(samples)
+print(f"Tamper detection rate: {rate:.4f} (expected ≈ 1.0)")
+
+# ===============================================================
+# B. VERIFICATION COST VS REPLAY COST
+# ===============================================================
+print("\n=== B. Verification vs Replay Cost ===")
+timings = []
+
+wallets = agg_df.sample(50, random_state=SEED)
+for _, row in wallets.iterrows():
+    addr = row[ADDRESS_COLUMN]
+
+    t0 = time.time()
+    _ = df[df[ADDRESS_COLUMN] == addr][FEATURE_COLUMNS].mean()
+    replay = (time.time() - t0) * 1000
+
+    t0 = time.time()
+    _ = verify_vfa(addr, df, row)
+    verify = (time.time() - t0) * 1000
+
+    timings.append((row['tx_count'], replay, verify))
+
+timings = pd.DataFrame(timings, columns=['tx_count','replay_ms','verify_ms'])
+print("\nReplay vs Verify timing summary (ms):")
+print(timings.describe())
+
+print("\nMedian speedup factor (replay / verify):",
+      (timings['replay_ms'] / timings['verify_ms']).median())
+
+# ===============================================================
+# C. PERFORMANCE PRESERVATION
+# ===============================================================
+print("\n=== C. Detection Performance Preservation ===")
+X = agg_df[FEATURE_COLUMNS].values
+y = agg_df[LABEL_COLUMN].values
+
+Xtr, Xte, ytr, yte = train_test_split(X, y, stratify=y, test_size=0.3, random_state=SEED)
+model = GradientBoostingClassifier(random_state=SEED)
+model.fit(Xtr, ytr)
+
+preds = model.predict_proba(Xte)[:,1]
+auc = roc_auc_score(yte, preds)
+print(f"AUC (VFA-compatible features): {auc:.4f}")
+
+# Bootstrap CI
+boot = []
+for _ in range(1000):
+    idx = np.random.choice(len(yte), len(yte), replace=True)
+    try:
+        boot.append(roc_auc_score(yte[idx], preds[idx]))
+    except:
+        pass
+
+print(f"AUC 95% CI: [{np.percentile(boot,2.5):.4f}, {np.percentile(boot,97.5):.4f}]")
+
+# ===============================================================
+# D. ADVERSARIAL EVASION COST
+# ===============================================================
+print("\n=== D. Adversarial Evasion Cost ===")
+def greedy_attack(addr, agg_row, max_changes=50):
+    df_l = df.copy()
+    wallet = df_l[df_l[ADDRESS_COLUMN] == addr].copy()
+    wallet = wallet.sort_values('total Ether sent', ascending=False)
+
+    changes = 0
+    for idx in wallet.index:
+        df_l.at[idx, 'total Ether sent'] *= 0.5
+        changes += 1
+
+        new_feats = df_l[df_l[ADDRESS_COLUMN] == addr][FEATURE_COLUMNS].mean().values.reshape(1,-1)
+        if model.predict_proba(new_feats)[0,1] < 0.5:
+            return changes
+        if changes >= max_changes:
+            break
+    return None
+
+attack_samples = agg_df.sample(100, random_state=SEED)
+results = []
+
+for _, row in attack_samples.iterrows():
+    res = greedy_attack(row[ADDRESS_COLUMN], row)
+    results.append(res)
+
+results = pd.Series(results)
+print("Fraction flipped with ≤5 tx changes:", (results <= 5).mean())
+print("Fraction flipped with ≤10 tx changes:", (results <= 10).mean())
+print("Fraction flipped with ≤20 tx changes:", (results <= 20).mean())
+

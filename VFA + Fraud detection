@@ -1,0 +1,175 @@
+import pandas as pd
+import hashlib
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+# CONFIGURATION
+
+FILE_PATH = 'transaction.csv'   # Your dataset
+LABEL_COLUMN = 'FLAG'
+
+FEATURE_COLUMNS = [
+    'Sent tnx',
+    'Received Tnx',
+    'total transactions (including tnx to create contract',
+    'total Ether sent',
+    'total ether received',
+    'total ether balance',
+    'avg val sent',
+    'min value received',
+    'max value received ',
+    'avg val received'
+]
+
+# ============================================================
+# HELPER FUNCTIONS — CRYPTO PRIMITIVES
+# ============================================================
+
+def sha256(x: str) -> str:
+    """SHA-256 helper."""
+    return hashlib.sha256(x.encode('utf-8')).hexdigest()
+
+
+def merkle_root(hashes):
+    """
+    Compute Merkle root from list of transaction hashes.
+    Deterministic and order-independent (sorted).
+    """
+    if len(hashes) == 0:
+        return None
+
+    level = sorted(hashes)
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level.append(level[-1])  # duplicate last if odd
+        level = [
+            sha256(level[i] + level[i + 1])
+            for i in range(0, len(level), 2)
+        ]
+    return level[0]
+
+
+def hash_feature_vector(feature_dict):
+    """
+    Deterministically hash aggregated features.
+    """
+    items = sorted(feature_dict.items())
+    canonical = '|'.join(f"{k}:{round(v, 6)}" for k, v in items)
+    return sha256(canonical)
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+print("Loading dataset...")
+df = pd.read_csv(FILE_PATH, low_memory=False)
+
+# Clean numeric columns
+for col in FEATURE_COLUMNS:
+    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+df[LABEL_COLUMN] = pd.to_numeric(df[LABEL_COLUMN], errors='coerce').fillna(0).astype(int)
+
+print("Total transactions:", len(df))
+print("Fraud rate (%):")
+print(df[LABEL_COLUMN].value_counts(normalize=True) * 100)
+
+# ============================================================
+# MAP PHASE — PER-TRANSACTION HASHING
+# ============================================================
+
+print("\n[Map] Hashing transactions...")
+
+df['tx_hash'] = df.apply(
+    lambda row: sha256(
+        f"{row['Address']}-" +
+        '-'.join(str(row[col]) for col in FEATURE_COLUMNS)
+    ),
+    axis=1
+)
+
+# ============================================================
+# REDUCE PHASE — AGGREGATION + PoAgg COMMITMENTS
+# ============================================================
+
+print("[Reduce] Aggregating features and generating PoAgg proofs...")
+
+agg_rows = []
+
+for address, group in df.groupby('Address'):
+    # --- Aggregate features (deterministic) ---
+    agg_features = group[FEATURE_COLUMNS].mean().to_dict()
+    label = int(group[LABEL_COLUMN].mean() >= 0.5)
+
+    # --- Proof-of-Aggregation objects ---
+    tx_hashes = group['tx_hash'].tolist()
+    merkle = merkle_root(tx_hashes)
+    feature_commitment = hash_feature_vector(agg_features)
+
+    agg_rows.append({
+        'Address': address,
+        **agg_features,
+        LABEL_COLUMN: label,
+        'merkle_root': merkle,
+        'feature_commitment': feature_commitment,
+        'num_transactions': len(group)
+    })
+
+agg_df = pd.DataFrame(agg_rows)
+
+print("Aggregated wallets:", len(agg_df))
+
+# ============================================================
+# VERIFIER FUNCTION (PoAgg CHECK)
+# ============================================================
+
+def verify_poa(address, original_df, agg_row):
+    """
+    Verifier checks Proof-of-Aggregation for one wallet.
+    """
+    wallet_df = original_df[original_df['Address'] == address]
+
+    # Recompute Merkle root
+    recomputed_root = merkle_root(wallet_df['tx_hash'].tolist())
+
+    # Recompute aggregation
+    recomputed_features = wallet_df[FEATURE_COLUMNS].mean().to_dict()
+    recomputed_commitment = hash_feature_vector(recomputed_features)
+
+    return (
+        recomputed_root == agg_row['merkle_root'] and
+        recomputed_commitment == agg_row['feature_commitment']
+    )
+
+# ============================================================
+# PoAgg VERIFICATION DEMO (IMPORTANT FOR PAPER)
+# ============================================================
+
+print("\nVerifying Proof-of-Aggregation for sample wallets...")
+
+sample_wallets = agg_df.sample(5, random_state=42)
+
+for _, row in sample_wallets.iterrows():
+    ok = verify_poa(row['Address'], df, row)
+    print(f"Wallet {row['Address']} verification:", "PASS" if ok else "FAIL")
+
+# ============================================================
+# MACHINE LEARNING (UNCHANGED CORE RESULT)
+# ============================================================
+
+X = agg_df[FEATURE_COLUMNS].values
+y = agg_df[LABEL_COLUMN].values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, stratify=y, random_state=42
+)
+
+model = GradientBoostingClassifier(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+preds = model.predict_proba(X_test)[:, 1]
+auc = roc_auc_score(y_test, preds)
+
+print("\n=== FRAUD DETECTION RESULT ===")
+print(f"AUC: {auc:.4f}")

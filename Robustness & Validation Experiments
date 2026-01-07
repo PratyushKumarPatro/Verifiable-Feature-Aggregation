@@ -1,6 +1,4 @@
-# ===============================================================
-# MUST-DO Robustness & Validation Experiments (PRINT-ONLY)
-# Verifiable Feature Aggregation (VFA) – ICBC 2026
+#Verifiable Feature Aggregation (VFA)
 # ===============================================================
 
 import time
@@ -13,9 +11,6 @@ from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 
-# ---------------------------
-# CONFIG
-# ---------------------------
 FILE_PATH = 'transaction.csv'
 ADDRESS_COLUMN = 'Address'
 LABEL_COLUMN = 'FLAG'
@@ -57,9 +52,6 @@ def hash_features(feat_dict):
     canonical = '|'.join(f"{k}:{round(float(v),6)}" for k,v in sorted(feat_dict.items()))
     return sha256(canonical)
 
-# ---------------------------
-# LOAD + PREP DATA
-# ---------------------------
 print("\n=== Loading dataset ===")
 df = pd.read_csv(FILE_PATH)
 
